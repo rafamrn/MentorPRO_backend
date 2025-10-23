@@ -7,6 +7,8 @@ from app.modules.tenants.models import Tenant
 from .models import User
 from .schemas import UserOut, UserCreateStaff
 from app.core.security import hash_password
+from app.modules.users.models import User
+from app.core.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -46,3 +48,14 @@ async def create_staff_user(
     await db.commit()
     await db.refresh(u)
     return u
+
+@router.get("/me")
+async def users_me(user: User = Depends(get_current_user)):
+    return {
+        "id": user.id,
+        "nome": user.nome,
+        "email": user.email,
+        "role": user.role,
+        "is_active": user.is_active,
+        "created_at": user.created_at,
+    }

@@ -2,27 +2,57 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-
 from app.core.config import settings
 from app.core.dependencies import get_db, get_current_user  # <-- ADICIONE ESTA LINHA
 from app.core.security import verify_password, create_access_token
 from app.modules.users.models import User
 from app.modules.tenants.models import Tenant
 from .schemas import LoginRequest, TokenOut
+from typing import Optional
+
 
 router = APIRouter()
 
+def _norm_tenant_id(x: Optional[str]) -> Optional[str]:
+    """
+    Trata "", " ", "undefined", "null" (strings) como None.
+    """
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() in {"undefined", "null"}:
+        return None
+    return s
+
 @router.post("/login", response_model=TokenOut)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
-    # valida tenant
-    t = await db.execute(select(Tenant).where(Tenant.id == payload.tenant_id))
-    tenant = t.scalar_one_or_none()
-    if not tenant:
-        raise HTTPException(status_code=400, detail="Tenant inválido")
+    tenant_id = _norm_tenant_id(payload.tenant_id)
 
-    # procura usuário
-    q = await db.execute(select(User).where(User.tenant_id == tenant.id, User.email == payload.email))
-    user = q.scalar_one_or_none()
+    # 1) Se veio tenant_id válido -> filtra por ele
+    if tenant_id is not None:
+        t = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant = t.scalar_one_or_none()
+        if not tenant:
+            # Em vez de falhar já aqui, tenta cair no fallback por e-mail
+            q = await db.execute(select(User).where(User.email == payload.email.lower()))
+            user = q.scalar_one_or_none()
+            if not user:
+                raise HTTPException(status_code=400, detail="Tenant inválido")
+            tenant_id = user.tenant_id
+        else:
+            q = await db.execute(
+                select(User).where(
+                    User.tenant_id == tenant.id,
+                    User.email == payload.email.lower()
+                )
+            )
+            user = q.scalar_one_or_none()
+    else:
+        # 2) Sem tenant_id -> busca usuário pelo e-mail e usa o tenant dele
+        q = await db.execute(select(User).where(User.email == payload.email.lower()))
+        user = q.scalar_one_or_none()
+        tenant_id = user.tenant_id if user else None
+
     if not user or not verify_password(payload.password, user.senha_hash):
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
 
@@ -30,11 +60,12 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Usuário inativo")
 
     token = create_access_token(
-        {"sub": str(user.id), "tenant_id": tenant.id, "role": user.role},
+        {"sub": str(user.id), "tenant_id": tenant_id, "role": user.role},
         expires_minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
         secret_key=settings.SECRET_KEY,
     )
     return TokenOut(access_token=token)
+
 
 @router.get("/me")
 async def me(user: User = Depends(lambda: None)):

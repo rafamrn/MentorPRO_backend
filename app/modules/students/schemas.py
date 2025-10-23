@@ -1,17 +1,51 @@
+# app/modules/students/schemas.py
 from pydantic import BaseModel, EmailStr
+from datetime import date
+from typing import Optional, List
 
-class StudentCreate(BaseModel):
+class StudentBase(BaseModel):
     nome: str
     email: EmailStr
-    documento: str | None = None
+    concurso: Optional[str] = None
+    telefone: Optional[str] = None
+    status: Optional[str] = "Ativo"
+    plano: Optional[str] = None
+    coach: Optional[str] = None
+    cpf: Optional[str] = None
+    dia_vencimento: Optional[int] = None
+    data_compra: Optional[date] = None
+    data_fim: Optional[date] = None
 
-class StudentOut(BaseModel):
+class StudentCreate(StudentBase):
+    pass
+
+class StudentUpdate(BaseModel):
+    nome: Optional[str] = None
+    concurso: Optional[str] = None
+    telefone: Optional[str] = None
+    status: Optional[str] = None
+    plano: Optional[str] = None
+    coach: Optional[str] = None
+    cpf: Optional[str] = None
+    dia_vencimento: Optional[int] = None
+    data_compra: Optional[date] = None
+    data_fim: Optional[date] = None
+
+class StudentOut(StudentBase):
     id: int
-    tenant_id: str
-    nome: str
-    email: EmailStr
-    documento: str | None = None
-    asaas_customer_id: str | None = None
-
     class Config:
         from_attributes = True
+
+# Bulk
+class BulkUpsertItem(StudentCreate):
+    pass
+
+# FE envia: { "alunos": [ ... ] }
+class BulkUpsertIn(BaseModel):
+    alunos: List[BulkUpsertItem]
+
+class BulkDeleteIn(BaseModel):
+    ids: List[int]
+
+class BulkDeleteOut(BaseModel):
+    count: int
