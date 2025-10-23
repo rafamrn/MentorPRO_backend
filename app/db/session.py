@@ -1,6 +1,11 @@
 # app/db/session.py
-from pathlib import Path
+import sys, asyncio
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from app.core.config import settings
+from pathlib import Path
 from app.core.config import settings
 
 if settings.DATABASE_URL:

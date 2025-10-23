@@ -4,7 +4,7 @@ from sqlalchemy import select
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from app.core.config import settings
-from app.core.dependencies import get_db
+from app.core.dependencies import get_db, get_current_user  # <-- ADICIONE ESTA LINHA
 from app.core.security import verify_password, create_access_token
 from app.modules.users.models import User
 from app.modules.tenants.models import Tenant
