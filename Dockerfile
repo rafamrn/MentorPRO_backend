@@ -18,4 +18,4 @@ COPY . .
 # Se você usa Alembic, descomente a linha abaixo no CMD para rodar migrações no start
 # CMD ["sh", "-c", "alembic upgrade head && uvicorn app:app --host 0.0.0.0 --port 8080"]
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
