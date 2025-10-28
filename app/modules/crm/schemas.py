@@ -1,84 +1,73 @@
+# app/modules/crm/schemas.py
 from __future__ import annotations
-
 from datetime import datetime
-from typing import Optional, List, Dict
-
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 
 
-# ---------------- Pipelines ----------------
-class CRMPipelineBase(BaseModel):
-    name: str = Field(..., min_length=1, max_length=120)
-    color: str = Field(default="border-l-primary")
+# ===================== FUNIS =====================
+class FunilBase(BaseModel):
+    nome: str = Field(..., max_length=120)
+    ordem: int | None = None
 
 
-class CRMPipelineCreate(CRMPipelineBase):
-    position: Optional[int] = None
+class FunilCreate(FunilBase):
+    pass
 
 
-class CRMPipelineUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
-    color: Optional[str] = None
-    position: Optional[int] = None
+class FunilUpdate(BaseModel):
+    nome: str | None = Field(None, max_length=120)
+    ordem: int | None = None
 
 
-class CRMPipelineOut(CRMPipelineBase):
-    id: int
-    position: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+class FunilOut(FunilBase):
+    id: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     class Config:
         from_attributes = True
 
 
-# ---------------- Leads ----------------
-class CRMLeadBase(BaseModel):
+# ===================== LEADS =====================
+class LeadBase(BaseModel):
     titulo: str
-    cpf: Optional[str] = None
-    telefone: Optional[str] = None
-    email: Optional[EmailStr] = None
-    estado: Optional[str] = None  # UF
-    cidade: Optional[str] = None
-    plano_desejado: Optional[str] = None
-    concurso_desejado: Optional[str] = None
-    descricao: Optional[str] = None
+    cpf: str | None = None
+    telefone: str | None = None
+    email: str | None = None
+    estado: str | None = None
+    cidade: str | None = None
+    planoDesejado: str | None = None
+    concursoDesejado: str | None = None
+    descricao: str | None = None
 
 
-class CRMLeadCreate(CRMLeadBase):
-    pipeline_id: Optional[int] = None   # se não enviar, vai para o primeiro pipeline
-    position: Optional[int] = None
+class LeadCreate(LeadBase):
+    stage_id: str
 
 
-class CRMLeadUpdate(CRMLeadBase):
-    pipeline_id: Optional[int] = None
-    position: Optional[int] = None
+class LeadUpdate(BaseModel):
+    # Atualizações do formulário
+    titulo: str | None = None
+    cpf: str | None = None
+    telefone: str | None = None
+    email: str | None = None
+    estado: str | None = None
+    cidade: str | None = None
+    planoDesejado: str | None = None
+    concursoDesejado: str | None = None
+    descricao: str | None = None
+
+    # Movimentação/Reordenação
+    stage_id: str | None = None
+    order_index: int | None = None
 
 
-class CRMLeadMove(BaseModel):
-    to_pipeline_id: int
-    to_position: int = 0
-
-
-class CRMLeadOut(CRMLeadBase):
+class LeadOut(LeadBase):
     id: int
-    pipeline_id: int
-    position: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    stage_id: str
+    order_index: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     class Config:
         from_attributes = True
-
-
-# -------------- Board (pipelines + leads) --------------
-class CRMBoardOut(BaseModel):
-    pipelines: List[CRMPipelineOut]
-    leads_by_pipeline: Dict[int, List[CRMLeadOut]]
-
-
-# -------------- Stats --------------
-class CRMStatsOut(BaseModel):
-    total_leads: int
-    closed_count: int
-    in_progress: int

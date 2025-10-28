@@ -1,392 +1,316 @@
+# app/modules/crm/router.py
 from __future__ import annotations
+from typing import List, Sequence
 
-from typing import List, Dict, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, func, update, delete
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_db, get_current_user, get_tenant
-from app.modules.users.models import User
-from app.modules.tenants.models import Tenant
-
-from .models import CRMLead, CRMPipeline
-from .schemas import (
-    CRMLeadCreate,
-    CRMLeadUpdate,
-    CRMLeadOut,
-    CRMLeadMove,
-    CRMPipelineCreate,
-    CRMPipelineUpdate,
-    CRMPipelineOut,
-    CRMBoardOut,
-    CRMStatsOut,
+from app.core.dependencies import get_current_user, get_db
+from app.modules.crm.models import CRMFunil, CRMLead
+from app.modules.crm.schemas import (
+    FunilCreate, FunilOut, FunilUpdate,
+    LeadCreate, LeadOut, LeadUpdate
 )
 
 router = APIRouter()
 
+# -------- Helpers --------
+def is_staff(user) -> bool:
+    return getattr(user, "role", None) in {"admin", "staff"}
 
-# ------------------------ helpers ------------------------
-async def _get_first_pipeline(db: AsyncSession, mentor_id: int) -> Optional[CRMPipeline]:
-    q = await db.execute(
-        select(CRMPipeline).where(CRMPipeline.mentor_id == mentor_id).order_by(CRMPipeline.position.asc(), CRMPipeline.id.asc())
+async def _ensure_funil_belongs(
+    db: AsyncSession,
+    tenant_id: str,
+    user_id: str,
+    funil_id: str,
+    can_see_all: bool
+) -> CRMFunil:
+    q = select(CRMFunil).where(CRMFunil.id == funil_id, CRMFunil.tenant_id == tenant_id)
+    if not can_see_all:
+        q = q.where(CRMFunil.owner_user_id == user_id)
+    res = await db.execute(q)
+    funil = res.scalar_one_or_none()
+    if not funil:
+        raise HTTPException(status_code=404, detail="Funil não encontrado")
+    return funil
+
+# -------- FUNIS --------
+@router.get("/funis", response_model=List[FunilOut])
+async def list_funis(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    q = (
+        select(CRMFunil)
+        .where(CRMFunil.tenant_id == user.tenant_id)
+        .order_by(CRMFunil.ordem.nulls_last(), CRMFunil.id)
     )
-    return q.scalars().first()
+    if not is_staff(user):
+        q = q.where(CRMFunil.owner_user_id == user.id)
 
+    res = await db.execute(q)
+    return res.scalars().all()
 
-async def _get_max_position_in_pipeline(db: AsyncSession, mentor_id: int, pipeline_id: int) -> int:
-    q = await db.execute(
-        select(func.coalesce(func.max(CRMLead.position), -1)).where(
-            CRMLead.mentor_id == mentor_id,
-            CRMLead.pipeline_id == pipeline_id,
+@router.post("/funis", response_model=FunilOut, status_code=status.HTTP_201_CREATED)
+async def create_funil(
+    payload: FunilCreate,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    res = await db.execute(
+        select(func.max(CRMFunil.ordem)).where(
+            CRMFunil.tenant_id == user.tenant_id,
+            CRMFunil.owner_user_id == user.id,
         )
     )
-    return int(q.scalar_one())
+    next_ord = (res.scalar() or 0) + 1
 
-
-# ------------------------ pipelines ------------------------
-@router.get("/pipelines", response_model=List[CRMPipelineOut])
-async def list_pipelines(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
-):
-    q = await db.execute(
-        select(CRMPipeline)
-        .where(CRMPipeline.mentor_id == tenant.id)
-        .order_by(CRMPipeline.position.asc(), CRMPipeline.id.asc())
+    funil = CRMFunil(
+        tenant_id=user.tenant_id,
+        owner_user_id=user.id,
+        nome=payload.nome.strip(),
+        ordem=payload.ordem if payload.ordem is not None else next_ord,
     )
-    return q.scalars().all()
-
-
-@router.post("/pipelines", response_model=CRMPipelineOut, status_code=status.HTTP_201_CREATED)
-async def create_pipeline(
-    payload: CRMPipelineCreate,
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
-):
-    # define position default = last + 1
-    if payload.position is None:
-        qpos = await db.execute(
-            select(func.coalesce(func.max(CRMPipeline.position), -1)).where(CRMPipeline.mentor_id == tenant.id)
-        )
-        payload.position = int(qpos.scalar_one()) + 1
-
-    obj = CRMPipeline(
-        mentor_id=tenant.id,
-        name=payload.name,
-        color=payload.color or "border-l-primary",
-        position=payload.position or 0,
-    )
-    db.add(obj)
+    db.add(funil)
     await db.flush()
-    await db.refresh(obj)
-    return obj
+    await db.commit()
+    await db.refresh(funil)
+    return funil
 
-
-@router.put("/pipelines/{pipeline_id}", response_model=CRMPipelineOut)
-async def update_pipeline(
-    pipeline_id: int,
-    payload: CRMPipelineUpdate,
+@router.patch("/funis/{funil_id}")
+async def update_funil(
+    funil_id: str,
+    payload: FunilUpdate,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
+    user=Depends(get_current_user),
 ):
-    q = await db.execute(
-        select(CRMPipeline).where(CRMPipeline.id == pipeline_id, CRMPipeline.mentor_id == tenant.id)
-    )
-    obj = q.scalars().first()
-    if not obj:
-        raise HTTPException(404, "Pipeline não encontrado")
+    funil = await _ensure_funil_belongs(db, user.tenant_id, user.id, funil_id, can_see_all=is_staff(user))
 
-    if payload.name is not None:
-        obj.name = payload.name.strip() or obj.name
-    if payload.color is not None:
-        obj.color = payload.color
-    if payload.position is not None:
-        obj.position = payload.position
+    if payload.nome is not None:
+        new_name = payload.nome.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Nome não pode ser vazio")
+        funil.nome = new_name
+
+    if payload.ordem is not None:
+        funil.ordem = payload.ordem
 
     await db.flush()
-    await db.refresh(obj)
-    return obj
+    await db.commit()
+    return {"ok": True}
 
-
-@router.delete("/pipelines/{pipeline_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_pipeline(
-    pipeline_id: int,
-    target_pipeline_id: Optional[int] = Query(None, description="Se informado, move os leads para este pipeline antes de deletar"),
+@router.delete("/funis/{funil_id}", status_code=204)
+async def delete_funil(
+    funil_id: str,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
+    user=Depends(get_current_user),
 ):
-    # pipeline a excluir
-    q = await db.execute(
-        select(CRMPipeline).where(CRMPipeline.id == pipeline_id, CRMPipeline.mentor_id == tenant.id)
+    funil = await _ensure_funil_belongs(db, user.tenant_id, user.id, funil_id, can_see_all=is_staff(user))
+
+    # apaga leads do mesmo dono naquele funil
+    await db.execute(
+        text("DELETE FROM crm_leads WHERE tenant_id = :t AND owner_user_id = :u AND stage_id = :s"),
+        {"t": user.tenant_id, "u": user.id, "s": funil.id},
     )
-    pipe = q.scalars().first()
-    if not pipe:
-        raise HTTPException(404, "Pipeline não encontrado")
+    await db.delete(funil)
+    await db.flush()
+    await db.commit()
+    return None
 
-    # leads existentes?
-    ql = await db.execute(
-        select(CRMLead.id).where(CRMLead.mentor_id == tenant.id, CRMLead.pipeline_id == pipeline_id)
-    )
-    lead_ids = [lid for (lid,) in ql.all()]
-
-    if lead_ids and not target_pipeline_id:
-        raise HTTPException(
-            400,
-            "Há leads neste pipeline. Informe 'target_pipeline_id' para mover antes de remover.",
-        )
-
-    if lead_ids and target_pipeline_id:
-        # valida pipeline destino
-        qdest = await db.execute(
-            select(CRMPipeline).where(CRMPipeline.id == target_pipeline_id, CRMPipeline.mentor_id == tenant.id)
-        )
-        dest = qdest.scalars().first()
-        if not dest:
-            raise HTTPException(400, "Pipeline destino inválido")
-
-        # move todos para o final do destino
-        maxpos = await _get_max_position_in_pipeline(db, tenant.id, dest.id)
-        await db.execute(
-            update(CRMLead)
-            .where(CRMLead.id.in_(lead_ids))
-            .values(pipeline_id=dest.id, position=maxpos + 1)
-        )
-
-    # remove pipeline
-    await db.execute(delete(CRMPipeline).where(CRMPipeline.id == pipeline_id))
-    return
-
-
-# ------------------------ leads ------------------------
-@router.get("/board", response_model=CRMBoardOut)
-async def get_board(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
-):
-    # pipelines
-    qp = await db.execute(
-        select(CRMPipeline)
-        .where(CRMPipeline.mentor_id == tenant.id)
-        .order_by(CRMPipeline.position.asc(), CRMPipeline.id.asc())
-    )
-    pipelines = qp.scalars().all()
-
-    # leads de todos
-    ql = await db.execute(
-        select(CRMLead)
-        .where(CRMLead.mentor_id == tenant.id)
-        .order_by(CRMLead.pipeline_id.asc(), CRMLead.position.asc(), CRMLead.id.asc())
-    )
-    leads = ql.scalars().all()
-
-    grouped: Dict[int, List[CRMLead]] = {}
-    for p in pipelines:
-        grouped[p.id] = []
-    for lead in leads:
-        grouped.setdefault(lead.pipeline_id, []).append(lead)
-
-    return {
-        "pipelines": pipelines,
-        "leads_by_pipeline": {pid: [lead for lead in lst] for pid, lst in grouped.items()},
-    }
-
-
-@router.get("/leads", response_model=List[CRMLeadOut])
+# -------- LEADS --------
+@router.get("/leads", response_model=List[LeadOut])
 async def list_leads(
-    pipeline_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
+    user=Depends(get_current_user),
 ):
-    stmt = select(CRMLead).where(CRMLead.mentor_id == tenant.id)
-    if pipeline_id:
-        stmt = stmt.where(CRMLead.pipeline_id == pipeline_id)
-    stmt = stmt.order_by(CRMLead.pipeline_id.asc(), CRMLead.position.asc(), CRMLead.id.asc())
+    q = (
+        select(CRMLead)
+        .where(CRMLead.tenant_id == user.tenant_id)
+        .order_by(CRMLead.stage_id, CRMLead.order_index, CRMLead.id)
+    )
+    if not is_staff(user):
+        q = q.where(CRMLead.owner_user_id == user.id)
 
-    q = await db.execute(stmt)
-    return q.scalars().all()
+    res = await db.execute(q)
+    return res.scalars().all()
 
-
-@router.post("/leads", response_model=CRMLeadOut, status_code=status.HTTP_201_CREATED)
+@router.post("/leads", response_model=LeadOut, status_code=status.HTTP_201_CREATED)
 async def create_lead(
-    payload: CRMLeadCreate,
+    payload: LeadCreate,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
+    user=Depends(get_current_user),
 ):
-    # pipeline default = primeiro por position
-    if not payload.pipeline_id:
-        first = await _get_first_pipeline(db, tenant.id)
-        if not first:
-            # cria funis padrão se necessário
-            first = CRMPipeline(mentor_id=tenant.id, name="Lead Recebido", color="border-l-primary", position=0)
-            db.add(first)
-            await db.flush()
-        payload.pipeline_id = first.id
+    # só permite criar no funil do próprio usuário (ou staff)
+    await _ensure_funil_belongs(db, user.tenant_id, user.id, payload.stage_id, can_see_all=is_staff(user))
 
-    # position default = final da coluna
-    if payload.position is None:
-        maxpos = await _get_max_position_in_pipeline(db, tenant.id, payload.pipeline_id)
-        payload.position = maxpos + 1
+    # último índice na coluna do próprio dono
+    q = await db.execute(
+        select(func.max(CRMLead.order_index)).where(
+            CRMLead.tenant_id == user.tenant_id,
+            CRMLead.owner_user_id == user.id,
+            CRMLead.stage_id == payload.stage_id,
+        )
+    )
+    idx = (q.scalar() or -1) + 1
 
-    obj = CRMLead(
-        mentor_id=tenant.id,
-        owner_id=user.id,
-        pipeline_id=payload.pipeline_id,
-        titulo=payload.titulo,
+    lead = CRMLead(
+        tenant_id=user.tenant_id,
+        owner_user_id=user.id,
+        stage_id=payload.stage_id,
+        order_index=idx,
+        titulo=payload.titulo.strip(),
         cpf=payload.cpf,
         telefone=payload.telefone,
-        email=str(payload.email) if payload.email else None,
+        email=payload.email,
         estado=payload.estado,
         cidade=payload.cidade,
-        plano_desejado=payload.plano_desejado,
-        concurso_desejado=payload.concurso_desejado,
+        planoDesejado=payload.planoDesejado,
+        concursoDesejado=payload.concursoDesejado,
         descricao=payload.descricao,
-        position=payload.position or 0,
     )
-    db.add(obj)
+    db.add(lead)
     await db.flush()
-    await db.refresh(obj)
-    return obj
+    await db.commit()
+    await db.refresh(lead)
+    return lead
 
-
-@router.put("/leads/{lead_id}", response_model=CRMLeadOut)
+@router.patch("/leads/{lead_id}")
 async def update_lead(
     lead_id: int,
-    payload: CRMLeadUpdate,
+    payload: LeadUpdate,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
+    user=Depends(get_current_user),
 ):
-    q = await db.execute(
-        select(CRMLead).where(CRMLead.id == lead_id, CRMLead.mentor_id == tenant.id)
-    )
-    obj = q.scalars().first()
-    if not obj:
-        raise HTTPException(404, "Lead não encontrado")
+    q = select(CRMLead).where(CRMLead.id == lead_id, CRMLead.tenant_id == user.tenant_id)
+    if not is_staff(user):
+        q = q.where(CRMLead.owner_user_id == user.id)
+    res = await db.execute(q)
+    lead = res.scalar_one_or_none()
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead não encontrado")
 
-    # altera pipeline?
-    if payload.pipeline_id is not None and payload.pipeline_id != obj.pipeline_id:
-        # mover para outra coluna no final
-        maxpos = await _get_max_position_in_pipeline(db, tenant.id, payload.pipeline_id)
-        obj.pipeline_id = payload.pipeline_id
-        obj.position = maxpos + 1
+    # updates simples
+    for f in ["titulo","cpf","telefone","email","estado","cidade","planoDesejado","concursoDesejado","descricao"]:
+        val = getattr(payload, f, None)
+        if val is not None:
+            setattr(lead, f, val.strip() if isinstance(val, str) else val)
 
-    # campos simples
-    if payload.titulo is not None:
-        obj.titulo = payload.titulo
-    if payload.cpf is not None:
-        obj.cpf = payload.cpf
-    if payload.telefone is not None:
-        obj.telefone = payload.telefone
-    if payload.email is not None:
-        obj.email = str(payload.email)
-    if payload.estado is not None:
-        obj.estado = payload.estado
-    if payload.cidade is not None:
-        obj.cidade = payload.cidade
-    if payload.plano_desejado is not None:
-        obj.plano_desejado = payload.plano_desejado
-    if payload.concurso_desejado is not None:
-        obj.concurso_desejado = payload.concurso_desejado
-    if payload.descricao is not None:
-        obj.descricao = payload.descricao
+    move_stage = payload.stage_id
+    target_index = payload.order_index
 
-    # posição manual (reordenação dentro da coluna)
-    if payload.position is not None:
-        obj.position = payload.position
+    # helper: reindex da coluna (por dono)
+    async def reindex(stage: str, owner_id: str):
+        r = await db.execute(
+            select(CRMLead)
+            .where(
+                CRMLead.tenant_id == user.tenant_id,
+                CRMLead.owner_user_id == owner_id,
+                CRMLead.stage_id == stage,
+            )
+            .order_by(CRMLead.order_index, CRMLead.id)
+        )
+        arr = list(r.scalars().all())
+        for i, l in enumerate(arr):
+            l.order_index = i
+
+    # se mover de coluna, garantir que a coluna destino pertence ao mesmo dono (ou staff)
+    if move_stage is not None:
+        await _ensure_funil_belongs(db, user.tenant_id, user.id, move_stage, can_see_all=is_staff(user))
+
+    owner_for_ops = lead.owner_user_id  # staff mantém o dono do lead
+
+    if move_stage is None and target_index is not None:
+        await reindex(lead.stage_id, owner_for_ops)
+        r = await db.execute(
+            select(CRMLead)
+            .where(
+                CRMLead.tenant_id == user.tenant_id,
+                CRMLead.owner_user_id == owner_for_ops,
+                CRMLead.stage_id == lead.stage_id,
+            )
+            .order_by(CRMLead.order_index, CRMLead.id)
+        )
+        lst = [l for l in r.scalars().all() if l.id != lead.id]
+        insert_at = max(0, min(target_index, len(lst)))
+        lst.insert(insert_at, lead)
+        for i, l in enumerate(lst):
+            l.order_index = i
+
+    if move_stage is not None:
+        old_stage = lead.stage_id
+        await reindex(old_stage, owner_for_ops)
+
+        # source (remove)
+        rsrc = await db.execute(
+            select(CRMLead)
+            .where(
+                CRMLead.tenant_id == user.tenant_id,
+                CRMLead.owner_user_id == owner_for_ops,
+                CRMLead.stage_id == old_stage,
+            )
+            .order_by(CRMLead.order_index, CRMLead.id)
+        )
+        src = [l for l in rsrc.scalars().all() if l.id != lead.id]
+        for i, l in enumerate(src):
+            l.order_index = i
+
+        # destino (insere)
+        rdst = await db.execute(
+            select(CRMLead)
+            .where(
+                CRMLead.tenant_id == user.tenant_id,
+                CRMLead.owner_user_id == owner_for_ops,
+                CRMLead.stage_id == move_stage,
+            )
+            .order_by(CRMLead.order_index, CRMLead.id)
+        )
+        dst = list(rdst.scalars().all())
+        insert_at = target_index if (target_index is not None and 0 <= target_index <= len(dst)) else len(dst)
+
+        lead.stage_id = move_stage
+        dst.insert(insert_at, lead)
+        for i, l in enumerate(dst):
+            l.order_index = i
 
     await db.flush()
-    await db.refresh(obj)
-    return obj
+    await db.commit()
+    return {"ok": True}
 
-
-@router.delete("/leads/{lead_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/leads/{lead_id}", status_code=204)
 async def delete_lead(
     lead_id: int,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
+    user=Depends(get_current_user),
 ):
-    q = await db.execute(
-        select(CRMLead).where(CRMLead.id == lead_id, CRMLead.mentor_id == tenant.id)
-    )
-    obj = q.scalars().first()
-    if not obj:
-        raise HTTPException(404, "Lead não encontrado")
+    q = select(CRMLead).where(CRMLead.id == lead_id, CRMLead.tenant_id == user.tenant_id)
+    if not is_staff(user):
+        q = q.where(CRMLead.owner_user_id == user.id)
+    res = await db.execute(q)
+    lead = res.scalar_one_or_none()
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead não encontrado")
 
-    await db.delete(obj)
-    return
+    stage = lead.stage_id
+    owner_for_ops = lead.owner_user_id
 
-
-@router.post("/leads/{lead_id}/move", response_model=CRMLeadOut)
-async def move_lead(
-    lead_id: int,
-    payload: CRMLeadMove,
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
-):
-    q = await db.execute(
-        select(CRMLead).where(CRMLead.id == lead_id, CRMLead.mentor_id == tenant.id)
-    )
-    obj = q.scalars().first()
-    if not obj:
-        raise HTTPException(404, "Lead não encontrado")
-
-    # valida destino
-    qdest = await db.execute(
-        select(CRMPipeline).where(CRMPipeline.id == payload.to_pipeline_id, CRMPipeline.mentor_id == tenant.id)
-    )
-    dest = qdest.scalars().first()
-    if not dest:
-        raise HTTPException(400, "Pipeline destino inválido")
-
-    obj.pipeline_id = dest.id
-    obj.position = max(0, payload.to_position)
-
+    await db.delete(lead)
     await db.flush()
-    await db.refresh(obj)
-    return obj
 
-
-# ------------------------ stats ------------------------
-@router.get("/stats", response_model=CRMStatsOut)
-async def get_stats(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_tenant),
-):
-    # total
-    q_total = await db.execute(
-        select(func.count(CRMLead.id)).where(CRMLead.mentor_id == tenant.id)
-    )
-    total = int(q_total.scalar_one() or 0)
-
-    # fechado = pipeline com nome 'Fechamento' (ou contains)
-    q_close_pipes = await db.execute(
-        select(CRMPipeline.id).where(
-            CRMPipeline.mentor_id == tenant.id,
-            func.lower(CRMPipeline.name).like("%fechamento%"),
+    # reindex da coluna do mesmo dono
+    await db.execute(
+        text("""
+        WITH ordered AS (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY order_index, id) - 1 AS rn
+          FROM crm_leads
+          WHERE tenant_id = :t AND owner_user_id = :u AND stage_id = :s
         )
+        UPDATE crm_leads l
+        SET order_index = o.rn
+        FROM ordered o
+        WHERE l.id = o.id
+        """),
+        {"t": user.tenant_id, "u": owner_for_ops, "s": stage},
     )
-    close_ids = [pid for (pid,) in q_close_pipes.all()] or [-1]
-
-    q_closed = await db.execute(
-        select(func.count(CRMLead.id)).where(
-            CRMLead.mentor_id == tenant.id, CRMLead.pipeline_id.in_(close_ids)
-        )
-    )
-    closed = int(q_closed.scalar_one() or 0)
-
-    return CRMStatsOut(
-        total_leads=total,
-        closed_count=closed,
-        in_progress=max(0, total - closed),
-    )
+    await db.commit()
+    return None
