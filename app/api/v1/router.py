@@ -1,6 +1,5 @@
 # app/api/v1/router.py
 from fastapi import APIRouter
-
 from app.modules.tenants.router import router as tenants_router
 from app.modules.students.router import router as students_router
 from app.modules.webhooks.router import router as webhooks_router
@@ -9,6 +8,9 @@ from app.modules.auth.router import router as auth_router
 from app.modules.users.router import router as users_router
 from app.modules.public.router import router as public_router
 from app.modules.products.router import router as products_router
+from app.modules.finance.router import router as finance_router
+from app.modules.concursos.router import router as concursos_router
+from app.modules.crm.router import router as crm_router
 
 api_router = APIRouter()
 
@@ -20,3 +22,6 @@ api_router.include_router(webhooks_router,prefix="/webhooks",tags=["webhooks"])
 api_router.include_router(admin_router,   prefix="/admin",   tags=["admin"])
 api_router.include_router(public_router)
 api_router.include_router(products_router, prefix="/products", tags=["products"])
+api_router.include_router(finance_router, prefix="/financeiro", tags=["financeiro"])
+api_router.include_router(concursos_router, prefix="/concursos", tags=["concursos"])
+api_router.include_router(crm_router, prefix="/crm", tags=["CRM"])
