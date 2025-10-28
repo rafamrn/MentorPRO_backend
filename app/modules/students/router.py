@@ -1,7 +1,7 @@
 # app/modules/students/router.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, and_
+from sqlalchemy import select, delete, and_, func
 from typing import List
 
 from app.core.dependencies import get_db, get_current_user
@@ -21,7 +21,8 @@ async def list_students(
     me: User = Depends(get_current_user),
     limit: int = Query(1000, le=100000),
     offset: int = 0,
-):
+    status: str | None = Query(None, description="Filtra pelo status do aluno (ex.: 'Ativo', 'Inativo')"),
+ ):
     stmt = (
         select(Student)
         .where(Student.mentor_id == me.id)
@@ -29,8 +30,22 @@ async def list_students(
         .limit(limit)
         .offset(offset)
     )
+    if status:
+        stmt = stmt.where(Student.status == status)
     res = await db.execute(stmt)
     return res.scalars().all()  # [] quando vazio
+
+@router.get("/active/count")
+async def count_active_students(
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    q = await db.execute(
+        select(func.count(Student.id)).where(
+            and_(Student.mentor_id == me.id, Student.status == "Ativo")
+        )
+    )
+    return {"count": q.scalar_one()}
 
 # CREATE
 @router.post("", response_model=StudentOut, status_code=status.HTTP_201_CREATED)
