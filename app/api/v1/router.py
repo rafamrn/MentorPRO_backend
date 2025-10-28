@@ -11,6 +11,7 @@ from app.modules.products.router import router as products_router
 from app.modules.finance.router import router as finance_router
 from app.modules.concursos.router import router as concursos_router
 from app.modules.crm.router import router as crm_router
+from app.modules.atividades.router import router as atividades_router
 
 api_router = APIRouter()
 
@@ -25,3 +26,4 @@ api_router.include_router(products_router, prefix="/products", tags=["products"]
 api_router.include_router(finance_router, prefix="/financeiro", tags=["financeiro"])
 api_router.include_router(concursos_router, prefix="/concursos", tags=["concursos"])
 api_router.include_router(crm_router, prefix="/crm", tags=["crm"])
+api_router.include_router(atividades_router, prefix="/atividades", tags=["atividades"])
