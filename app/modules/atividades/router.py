@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from datetime import date, timedelta
 from app.core.dependencies import get_current_user, get_db
 from app.modules.atividades import schemas as s
+from app.modules.users.models import User
 from app.modules.atividades.models import ActivityStage, Activity
 
 router = APIRouter()
@@ -292,3 +293,49 @@ async def delete_atividade(
     await _compact_order_indices(db, current_user.id, stage_id)
     await db.commit()
     return None
+
+@router.get("/due/count")
+async def count_due_activities(
+    days: int = Query(5, ge=1, le=60, description="Janela em dias a partir de hoje (inclui hoje)"),
+    exclude_done: bool = Query(True, description="Excluir colunas de 'concluídas'?"),
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    """
+    Conta atividades com data_vencimento ∈ [hoje .. hoje+days], do owner atual.
+    Por padrão exclui colunas/funís 'concluídas' (nome contendo 'conclu'|'feito'|'done').
+    """
+    today = date.today()
+    end = today + timedelta(days=days)
+
+    stmt = select(func.count(Activity.id)).where(
+        and_(
+            Activity.owner_id == me.id,
+            Activity.data_vencimento.is_not(None),
+            Activity.data_vencimento >= today,
+            Activity.data_vencimento <= end,
+        )
+    )
+
+    if exclude_done:
+        # Exclui estágios cujo nome sugira "concluído"
+        stmt = (
+            select(func.count(Activity.id))
+            .select_from(Activity)
+            .join(ActivityStage, Activity.stage_id == ActivityStage.id)
+            .where(
+                and_(
+                    Activity.owner_id == me.id,
+                    Activity.data_vencimento.is_not(None),
+                    Activity.data_vencimento >= today,
+                    Activity.data_vencimento <= end,
+                    ~func.lower(ActivityStage.nome).like("%conclu%"),
+                    ~func.lower(ActivityStage.nome).like("%feito%"),
+                    ~func.lower(ActivityStage.nome).like("%done%"),
+                )
+            )
+        )
+
+    res = await db.execute(stmt)
+    (count,) = res.one()
+    return {"count": int(count)}

@@ -1,9 +1,11 @@
 # app/modules/students/router.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timedelta, date, timezone
 from sqlalchemy import select, delete, and_, func
 from typing import List
-
+from app.modules.products.models import Product
+from .schemas import RevenueByCreatedOut
 from app.core.dependencies import get_db, get_current_user
 from app.modules.users.models import User
 from .models import Student
@@ -21,28 +23,54 @@ async def list_students(
     me: User = Depends(get_current_user),
     limit: int = Query(1000, le=100000),
     offset: int = 0,
-    status: str | None = Query(None, description="Filtra pelo status do aluno (ex.: 'Ativo', 'Inativo')"),
- ):
+    data_compra_ini: str | None = Query(None, description="YYYY-MM-DD"),
+    data_compra_fim: str | None = Query(None, description="YYYY-MM-DD"),
+):
     stmt = (
         select(Student)
         .where(Student.mentor_id == me.id)
-        .order_by(Student.nome.asc())
-        .limit(limit)
-        .offset(offset)
     )
-    if status:
-        stmt = stmt.where(Student.status == status)
-    res = await db.execute(stmt)
-    return res.scalars().all()  # [] quando vazio
 
-@router.get("/active/count")
-async def count_active_students(
+    # filtros por data_compra (fechando intervalo inclusive)
+    from datetime import datetime, date
+    if data_compra_ini:
+        try:
+            d_ini = datetime.strptime(data_compra_ini, "%Y-%m-%d").date()
+            stmt = stmt.where(Student.data_compra >= d_ini)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="data_compra_ini inválida (use YYYY-MM-DD)")
+    if data_compra_fim:
+        try:
+            d_fim = datetime.strptime(data_compra_fim, "%Y-%m-%d").date()
+            stmt = stmt.where(Student.data_compra <= d_fim)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="data_compra_fim inválida (use YYYY-MM-DD)")
+
+    stmt = stmt.order_by(Student.nome.asc()).limit(limit).offset(offset)
+
+    res = await db.execute(stmt)
+    return res.scalars().all()
+
+@router.get("/created/count")
+async def count_created_students(
     db: AsyncSession = Depends(get_db),
     me: User = Depends(get_current_user),
+    ini: str = Query(..., description="YYYY-MM-DD"),
+    fim: str = Query(..., description="YYYY-MM-DD (inclusive)"),
 ):
+    try:
+        dt_ini = datetime.fromisoformat(ini).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_fim = datetime.fromisoformat(fim).replace(hour=23, minute=59, second=59, microsecond=999999)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Parâmetros ini/fim inválidos. Use YYYY-MM-DD.")
+
     q = await db.execute(
         select(func.count(Student.id)).where(
-            and_(Student.mentor_id == me.id, Student.status == "Ativo")
+            and_(
+                Student.mentor_id == me.id,
+                Student.created_at >= dt_ini,
+                Student.created_at <= dt_fim,
+            )
         )
     )
     return {"count": q.scalar_one()}
@@ -126,3 +154,54 @@ async def bulk_delete(
     res = await db.execute(stmt)
     await db.commit()
     return {"count": res.rowcount or len(inp.ids)}
+
+@router.get("/revenue/purchases", response_model=RevenueByCreatedOut)
+async def revenue_by_purchases(
+    ini: str,  # YYYY-MM-DD
+    fim: str,  # YYYY-MM-DD
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    """
+    Soma Product.valor dos alunos cuja data_compra está no intervalo [ini..fim] (inclusive),
+    combinando Student.plano == Product.nome e mesmo mentor_id. Produtos inativos não entram.
+    """
+    # valida datas
+    try:
+        d_ini = datetime.strptime(ini, "%Y-%m-%d").date()
+        d_fim = datetime.strptime(fim, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Datas inválidas. Use YYYY-MM-DD.")
+
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="fim não pode ser menor que ini.")
+
+    # LEFT JOIN para contar alunos mesmo sem produto correspondente; soma ignora NULL
+    stmt = (
+        select(
+            func.coalesce(func.sum(Product.valor), 0).label("total"),
+            func.count(Student.id).label("count"),
+        )
+        .select_from(Student)
+        .join(
+            Product,
+            and_(
+                Product.nome == Student.plano,
+                Product.mentor_id == Student.mentor_id,
+                Product.ativo == True,
+            ),
+            isouter=True,
+        )
+        .where(
+            and_(
+                Student.mentor_id == me.id,
+                Student.data_compra.is_not(None),
+                Student.data_compra >= d_ini,
+                Student.data_compra <= d_fim,
+            )
+        )
+    )
+
+    res = await db.execute(stmt)
+    total, count = res.one_or_none() or (0, 0)
+    return RevenueByCreatedOut(total=float(total or 0), count=int(count or 0))

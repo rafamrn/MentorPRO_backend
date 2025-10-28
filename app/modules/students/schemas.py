@@ -1,5 +1,5 @@
 # app/modules/students/schemas.py
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from datetime import date
 from typing import Optional, List
 
@@ -49,3 +49,8 @@ class BulkDeleteIn(BaseModel):
 
 class BulkDeleteOut(BaseModel):
     count: int
+
+class RevenueByCreatedOut(BaseModel):
+    total: float    # soma em R$
+    count: int      # nº de alunos no período (com ou sem preço)
+    model_config = ConfigDict(from_attributes=True)
