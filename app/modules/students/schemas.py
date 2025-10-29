@@ -33,6 +33,7 @@ class StudentUpdate(BaseModel):
 
 class StudentOut(StudentBase):
     id: int
+    asaas_customer_id: str | None = None
     class Config:
         from_attributes = True
 

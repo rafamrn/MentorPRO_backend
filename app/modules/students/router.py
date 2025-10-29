@@ -1,9 +1,12 @@
 # app/modules/students/router.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime
 from sqlalchemy import select, delete, and_, func
-from typing import List
+from typing import List, Optional
+import httpx
+import re
+from app.modules.asaas.models import AsaasConfig
 from app.modules.products.models import Product
 from .schemas import RevenueByCreatedOut
 from app.core.dependencies import get_db, get_current_user
@@ -15,6 +18,50 @@ from .schemas import (
 )
 
 router = APIRouter()  # <— sem prefixo aqui
+
+# ==== Helpers Asaas ====
+def _digits(s: Optional[str]) -> str:
+    return re.sub(r"\D+", "", s or "")
+
+def _cpf_cnpj_or_none(value: Optional[str]) -> Optional[str]:
+    d = _digits(value)
+    return d if len(d) in (11, 14) else None
+
+def _mobile_or_none(value: Optional[str]) -> Optional[str]:
+    d = _digits(value)
+    return d or None
+
+async def _get_asaas_config(db: AsyncSession, mentor_id: int) -> Optional[AsaasConfig]:
+    """
+    Busca api_key/sandbox por mentor.
+    Ajuste este SELECT se sua tabela/campos tiverem outros nomes.
+    """
+    res = await db.execute(
+        select(AsaasConfig).where(AsaasConfig.mentor_id == mentor_id)
+    )
+    return res.scalar_one_or_none()
+
+async def _asaas_create_customer(*, api_key: str, sandbox: bool, name: str,
+                                 cpf_cnpj: Optional[str], email: Optional[str],
+                                 mobile_phone: Optional[str]) -> dict:
+    base = "https://api-sandbox.asaas.com/v3" if sandbox else "https://api.asaas.com/v3"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "access_token": api_key,
+    }
+    payload = {
+        "name": name,
+        "cpfCnpj": cpf_cnpj,
+        "email": email,
+        "mobilePhone": mobile_phone,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(f"{base}/customers", json=payload, headers=headers)
+        # Se falhar, levanta erro (você pode querer tratar 409 de duplicidade diferente)
+        r.raise_for_status()
+        return r.json()
+# =======================
 
 # LIST
 @router.get("", response_model=list[StudentOut])
@@ -82,8 +129,34 @@ async def create_student(
     db: AsyncSession = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
+    # 1) Cria o aluno no banco
     obj = Student(**payload.model_dump(), mentor_id=me.id)
     db.add(obj)
+    await db.flush()     # garante PK sem fechar a transação
+
+    # 2) Busca config Asaas do mentor
+    cfg = await _get_asaas_config(db, mentor_id=me.id)
+
+    if cfg:
+        # 3) Normaliza campos e chama Asaas
+        cpf_cnpj = _cpf_cnpj_or_none(obj.cpf)
+        mobile   = _mobile_or_none(obj.telefone)
+        try:
+            resp = await _asaas_create_customer(
+                api_key=cfg.api_key,
+                sandbox=cfg.sandbox,
+                name=obj.nome,
+                cpf_cnpj=cpf_cnpj,
+                email=obj.email,
+                mobile_phone=mobile,
+            )
+            obj.asaas_customer_id = resp.get("id")
+        except httpx.HTTPStatusError as e:
+            # Política: não bloquear criação do aluno; apenas segue sem asaas_customer_id
+            # Para bloquear, troque por raise HTTPException(...)
+            # Se quiser tratar 409 (duplicado), você pode buscar o id existente e setar aqui.
+            pass
+
     await db.commit()
     await db.refresh(obj)
     return obj
@@ -117,29 +190,41 @@ async def delete_student(
     db: AsyncSession = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
+    # 1) Busca aluno e garante que pertence ao mentor
     res = await db.execute(
-        select(Student.id).where(and_(Student.id == student_id, Student.mentor_id == me.id))
+        select(Student).where(and_(Student.id == student_id, Student.mentor_id == me.id))
     )
-    if not res.scalar_one_or_none():
+    student = res.scalar_one_or_none()
+    if not student:
         raise HTTPException(status_code=404, detail="Aluno não encontrado")
+
+    # 2) Se aluno tem asaas_customer_id, tenta deletar no Asaas
+    if student.asaas_customer_id:
+        # usa helper já existente para pegar a config
+        cfg = await _get_asaas_config(db, mentor_id=me.id)
+        if cfg:
+            base = "https://api-sandbox.asaas.com/v3" if cfg.sandbox else "https://api.asaas.com/v3"
+            headers = {
+                "accept": "application/json",
+                "access_token": cfg.api_key,
+            }
+            url = f"{base}/customers/{student.asaas_customer_id}"
+
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.delete(url, headers=headers)
+                    # sucesso normalmente 200/204; se falhar, apenas loga e segue
+                    if r.status_code >= 400:
+                        print(f"[ASAAS] Falha ao excluir cliente {student.asaas_customer_id}: {r.status_code} {r.text}")
+            except Exception as e:
+                print(f"[ASAAS] Erro ao chamar API de exclusão: {e}")
+
+    # 3) Exclui aluno localmente
     await db.execute(delete(Student).where(Student.id == student_id))
     await db.commit()
     return
 
-# BULK UPSERT — o FE envia { alunos: [...] } em /students/bulk_upsert (POST)
-@router.post("/bulk_upsert", response_model=BulkDeleteOut)  # {"count": n}
-async def bulk_upsert(
-    inp: BulkUpsertIn,
-    db: AsyncSession = Depends(get_db),
-    me: User = Depends(get_current_user),
-):
-    created = 0
-    for it in inp.alunos:
-        obj = Student(**it.model_dump(), mentor_id=me.id)
-        db.add(obj)
-        created += 1
-    await db.commit()
-    return {"count": created}
+
 
 # BULK DELETE — o FE faz DELETE /students/bulk com body { ids: [...] }
 @router.delete("/bulk", response_model=BulkDeleteOut)
@@ -205,3 +290,48 @@ async def revenue_by_purchases(
     res = await db.execute(stmt)
     total, count = res.one_or_none() or (0, 0)
     return RevenueByCreatedOut(total=float(total or 0), count=int(count or 0))
+
+@router.post("/{student_id}/asaas/sync", response_model=StudentOut)
+async def sync_student_asaas(
+    student_id: int,
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    res = await db.execute(
+        select(Student).where(and_(Student.id == student_id, Student.mentor_id == me.id))
+    )
+    obj = res.scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+
+    if obj.asaas_customer_id:
+        return obj  # já sincronizado
+
+    cfg = await _get_asaas_config(db, mentor_id=me.id)
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Configuração Asaas não encontrada para este mentor")
+
+    cpf_cnpj = _cpf_cnpj_or_none(obj.cpf)
+    mobile   = _mobile_or_none(obj.telefone)
+
+    try:
+        resp = await _asaas_create_customer(
+            api_key=cfg.api_key,
+            sandbox=cfg.sandbox,
+            name=obj.nome,
+            cpf_cnpj=cpf_cnpj,
+            email=obj.email,
+            mobile_phone=mobile,
+        )
+        obj.asaas_customer_id = resp.get("id")
+        await db.commit()
+        await db.refresh(obj)
+        return obj
+    except httpx.HTTPStatusError as e:
+        # expondo retorno do Asaas para debug no FE (422/409/etc.)
+        detail = {"message": "Falha ao criar cliente no Asaas"}
+        try:
+            detail["asaas"] = e.response.json()
+        except Exception:
+            detail["asaas_raw"] = e.response.text
+        raise HTTPException(status_code=502, detail=detail)
