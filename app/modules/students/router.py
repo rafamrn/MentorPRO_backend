@@ -61,6 +61,74 @@ async def _asaas_create_customer(*, api_key: str, sandbox: bool, name: str,
         # Se falhar, levanta erro (você pode querer tratar 409 de duplicidade diferente)
         r.raise_for_status()
         return r.json()
+    
+async def _asaas_update_customer(
+    *,
+    api_key: str,
+    sandbox: bool,
+    customer_id: str,
+    name: str | None = None,
+    cpf_cnpj: str | None = None,
+    email: str | None = None,
+    mobile_phone: str | None = None,
+) -> dict:
+    """
+    Atualiza um cliente no Asaas.
+    Envia apenas os campos não nulos para não sobrescrever com null.
+    """
+    base = "https://api-sandbox.asaas.com/v3" if sandbox else "https://api.asaas.com/v3"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "access_token": api_key,
+    }
+
+    payload = {}
+    if name:        payload["name"] = name
+    if cpf_cnpj:    payload["cpfCnpj"] = cpf_cnpj
+    if email:       payload["email"] = email
+    if mobile_phone: payload["mobilePhone"] = mobile_phone
+
+    # Se nada mudou, evite a chamada desnecessária
+    if not payload:
+        return {"skipped": True}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.put(f"{base}/customers/{customer_id}", json=payload, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+    
+async def _asaas_find_customer(*, api_key: str, sandbox: bool,
+                               cpf_cnpj: Optional[str] = None,
+                               email: Optional[str] = None) -> Optional[str]:
+    """Tenta localizar um cliente já existente no Asaas e retorna o ID, se achar."""
+    base = "https://api-sandbox.asaas.com/v3" if sandbox else "https://api.asaas.com/v3"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "access_token": api_key,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # 1) procura por CPF/CNPJ (melhor precisão)
+        if cpf_cnpj:
+            r = await client.get(f"{base}/customers", params={"cpfCnpj": cpf_cnpj}, headers=headers)
+            r.raise_for_status()
+            data = r.json() or {}
+            items = data.get("data") or data.get("items") or []
+            if items:
+                return items[0].get("id")
+
+        # 2) fallback por e-mail
+        if email:
+            r = await client.get(f"{base}/customers", params={"email": email}, headers=headers)
+            r.raise_for_status()
+            data = r.json() or {}
+            items = data.get("data") or data.get("items") or []
+            if items:
+                return items[0].get("id")
+
+    return None
 # =======================
 
 # LIST
@@ -169,6 +237,7 @@ async def update_student(
     db: AsyncSession = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
+    # 1) Busca aluno do mentor logado
     res = await db.execute(
         select(Student).where(and_(Student.id == student_id, Student.mentor_id == me.id))
     )
@@ -176,12 +245,155 @@ async def update_student(
     if not obj:
         raise HTTPException(status_code=404, detail="Aluno não encontrado")
 
+    # 2) Aplica alterações locais
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
+    # 3) Se já está sincronizado com Asaas, tenta atualizar lá também
+    #    (usa config do mentor e normaliza os campos)
+    if obj.asaas_customer_id:
+        cfg = await _get_asaas_config(db, mentor_id=me.id)
+        if cfg:
+            cpf_cnpj = _cpf_cnpj_or_none(obj.cpf)
+            mobile   = _mobile_or_none(obj.telefone)
+            try:
+                await _asaas_update_customer(
+                    api_key=cfg.api_key,
+                    sandbox=cfg.sandbox,
+                    customer_id=obj.asaas_customer_id,
+                    name=obj.nome,
+                    cpf_cnpj=cpf_cnpj,
+                    email=obj.email,
+                    mobile_phone=mobile,
+                )
+            except httpx.HTTPStatusError as e:
+                # política: não bloquear o update local se Asaas falhar
+                # (se quiser bloquear, troque por raise HTTPException com detail do Asaas)
+                # print para logar em desenvolvimento:
+                try:
+                    print("[ASAAS][PUT] Falha:", e.response.status_code, e.response.text)
+                except Exception:
+                    print("[ASAAS][PUT] Falha desconhecida ao atualizar cliente")
+
+    # 4) Commit e retorno
     await db.commit()
     await db.refresh(obj)
     return obj
+
+
+@router.post("/bulk_upsert", response_model=BulkDeleteOut)
+async def bulk_upsert(
+    inp: BulkUpsertIn,
+    sync_asaas: bool = Query(False, description="Se true, cria/sincroniza clientes na Asaas para cada aluno importado"),
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    created = 0
+
+    # Carrega cfg só uma vez
+    cfg = None
+    if sync_asaas:
+        cfg = await _get_asaas_config(db, mentor_id=me.id)
+
+    for it in inp.alunos:
+        obj = Student(**it.model_dump(), mentor_id=me.id)
+        db.add(obj)
+        created += 1
+
+        # Sincroniza com Asaas se habilitado e houver cfg
+        if sync_asaas and cfg:
+            cpf_cnpj = _cpf_cnpj_or_none(obj.cpf)
+            mobile   = _mobile_or_none(obj.telefone)
+            try:
+                resp = await _asaas_create_customer(
+                    api_key=cfg.api_key,
+                    sandbox=cfg.sandbox,
+                    name=obj.nome,
+                    cpf_cnpj=cpf_cnpj,
+                    email=obj.email,
+                    mobile_phone=mobile,
+                )
+                obj.asaas_customer_id = resp.get("id")
+            except httpx.HTTPStatusError as e:
+                # Se já existe (ex.: 409) tentamos buscar o ID e vincular
+                try:
+                    existing_id = await _asaas_find_customer(
+                        api_key=cfg.api_key,
+                        sandbox=cfg.sandbox,
+                        cpf_cnpj=cpf_cnpj,
+                        email=obj.email,
+                    )
+                    if existing_id:
+                        obj.asaas_customer_id = existing_id
+                except Exception:
+                    # não bloqueia importação
+                    pass
+            except Exception:
+                # não bloqueia importação
+                pass
+
+    await db.commit()
+    return {"count": created}
+
+# BULK DELETE — o FE faz DELETE /students/bulk com body { ids: [...] }
+@router.delete("/bulk", response_model=BulkDeleteOut)
+async def bulk_delete(
+    inp: BulkDeleteIn = Body(...),
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    # nada para apagar?
+    if not inp.ids:
+        return {"count": 0}
+
+    # 1) Carrega os alunos pertencentes ao mentor logado, limitando aos IDs informados
+    res = await db.execute(
+        select(Student).where(
+            and_(Student.mentor_id == me.id, Student.id.in_(inp.ids))
+        )
+    )
+    students = res.scalars().all()
+    if not students:
+        return {"count": 0}
+
+    # 2) Se houver config do Asaas e alunos com asaas_customer_id, tenta apagar no Asaas
+    cfg = await _get_asaas_config(db, mentor_id=me.id)
+    if cfg:
+        base = "https://api-sandbox.asaas.com/v3" if cfg.sandbox else "https://api.asaas.com/v3"
+        headers = {
+            "accept": "application/json",
+            "access_token": cfg.api_key,
+        }
+
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                for st in students:
+                    if not st.asaas_customer_id:
+                        continue
+                    url = f"{base}/customers/{st.asaas_customer_id}"
+                    try:
+                        r = await client.delete(url, headers=headers)
+                        # Sucesso normalmente 200/204. Se falhar, apenas loga e continua.
+                        if r.status_code >= 400:
+                            print(f"[ASAAS] Falha ao excluir cliente {st.asaas_customer_id}: "
+                                  f"{r.status_code} {r.text}")
+                    except Exception as e:
+                        print(f"[ASAAS] Erro ao chamar API de exclusão ({st.asaas_customer_id}): {e}")
+        except Exception as e:
+            # se der algum erro geral, não bloqueia a remoção local
+            print(f"[ASAAS] Erro geral no bulk delete: {e}")
+
+    # 3) Remove localmente no banco
+    await db.execute(
+        delete(Student).where(
+            and_(Student.mentor_id == me.id, Student.id.in_(inp.ids))
+        )
+    )
+    await db.commit()
+
+    return {"count": len(students)}
+
 
 # DELETE (um)
 @router.delete("/{student_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -224,21 +436,6 @@ async def delete_student(
     await db.commit()
     return
 
-
-
-# BULK DELETE — o FE faz DELETE /students/bulk com body { ids: [...] }
-@router.delete("/bulk", response_model=BulkDeleteOut)
-async def bulk_delete(
-    inp: BulkDeleteIn = Body(...),
-    db: AsyncSession = Depends(get_db),
-    me: User = Depends(get_current_user),
-):
-    if not inp.ids:
-        return {"count": 0}
-    stmt = delete(Student).where(and_(Student.mentor_id == me.id, Student.id.in_(inp.ids)))
-    res = await db.execute(stmt)
-    await db.commit()
-    return {"count": res.rowcount or len(inp.ids)}
 
 @router.get("/revenue/purchases", response_model=RevenueByCreatedOut)
 async def revenue_by_purchases(
