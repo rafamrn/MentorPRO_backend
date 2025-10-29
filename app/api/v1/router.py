@@ -14,6 +14,7 @@ from app.modules.crm.router import router as crm_router
 from app.modules.atividades.router import router as atividades_router
 from app.modules.metrics.router import router as metrics_router
 from app.modules.asaas.router import router as asaas_router
+from app.modules.equipe.router import router as equipe_router
 
 api_router = APIRouter()
 
@@ -31,3 +32,4 @@ api_router.include_router(crm_router, prefix="/crm", tags=["crm"])
 api_router.include_router(atividades_router, prefix="/atividades", tags=["atividades"])
 api_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
 api_router.include_router(asaas_router, prefix="/billing", tags=["Billing/Asaas"])
+api_router.include_router(equipe_router, prefix="/equipe", tags=["Equipe"])
