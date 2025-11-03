@@ -1,14 +1,17 @@
+# app/modules/financeiro/router.py
 from __future__ import annotations
-from fastapi import APIRouter, Depends, HTTPException, Query, Path, Body
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Path, Body, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from datetime import date, datetime
 import calendar as _cal
+from pydantic import BaseModel, Field
 
 from app.core.dependencies import get_db, get_current_user
 from app.modules.users.models import User
 from app.modules.products.models import Product
-from app.modules.students.models import Student  # ajuste: caminho do seu Student
+from app.modules.students.models import Student
 from .models import Pagamento
 from .schemas import (
     PagamentoOut, PagamentoUpdate, PagamentoListOut,
@@ -24,6 +27,14 @@ def _ym_to_year_month(ym: str) -> tuple[int, int]:
     if mi < 1 or mi > 12:
         raise ValueError("Mês inválido em competencia (use YYYY-MM).")
     return yi, mi
+
+def _normalize_competencia(raw: str) -> str:
+    """Aceita 'YYYY-MM' ou 'YYYY-MM-01' e retorna 'YYYY-MM'."""
+    s = raw.strip()
+    if len(s) >= 7:
+        s = s[:7]
+    _ym_to_year_month(s)  # valida
+    return s
 
 def _prev_year_month(today: date | None = None) -> str:
     d = today or date.today()
@@ -55,7 +66,6 @@ async def _produto_valor_for_student(db: AsyncSession, st: Student) -> float | N
     prod = res.scalar_one_or_none()
     if not prod:
         return None
-    # tente campos comuns
     for k in ("valor", "price", "preco"):
         v = getattr(prod, k, None)
         if v is not None:
@@ -80,8 +90,6 @@ def _due_for(competencia: str, st) -> date | None:
     return date(y, m, d)
 
 # ---------- rotas ----------
-# app/modules/financeiro/router.py
-
 @router.get("", response_model=PagamentoListOut)
 async def list_pagamentos(
     student_id: int | None = Query(None),
@@ -141,7 +149,6 @@ async def sync_competencias_for_student(
     - due_date: usa overwrite_due_date (se enviado) OU o dia_vencimento do aluno (clamp no fim do mês).
     - valor: usa body.valor (se enviado) OU tenta descobrir pelo Product vinculado ao plano do aluno.
     """
-    # aluno
     r = await db.execute(
         select(Student).where(and_(Student.id == student_id, Student.mentor_id == me.id))
     )
@@ -152,18 +159,15 @@ async def sync_competencias_for_student(
     if not st.data_compra:
         raise HTTPException(status_code=400, detail="Aluno sem data_compra definida")
 
-    # monta intervalo de competências
     start_ym = f"{st.data_compra.year:04d}-{st.data_compra.month:02d}"
     end_ym = body.ate_competencia or _prev_year_month()
 
-    # valor padrão
     default_valor = body.valor
     if default_valor is None:
         default_valor = await _produto_valor_for_student(db, st)
 
     created, skipped = 0, 0
     for ym in _iter_ym(start_ym, end_ym):
-        # já existe?
         exists = await db.scalar(
             select(func.count(Pagamento.id)).where(
                 and_(
@@ -194,3 +198,98 @@ async def sync_competencias_for_student(
 
     await db.commit()
     return SyncCompetenciasOut(created=created, skipped=skipped)
+
+# ---------- marcar como pago ----------
+class PagamentoMarkPaidIn(BaseModel):
+    aluno_id: int = Field(..., gt=0)
+    competencia: str  # "YYYY-MM" ou "YYYY-MM-01"
+    valor: float = Field(..., gt=0)
+    data_pagamento: date = Field(..., description="YYYY-MM-DD")
+    meio: str | None = None
+    referencia: str | None = None
+
+# Suporte a AMBOS caminhos:
+# - POST ""  (quando o router é montado em "/financeiro/pagamentos")
+# - POST "/pagamentos" (quando o router é montado em "/financeiro")
+@router.post("", response_model=PagamentoOut, status_code=status.HTTP_201_CREATED)
+@router.post("/pagamentos", response_model=PagamentoOut, status_code=status.HTTP_201_CREATED)
+async def mark_paid_upsert(
+    body: PagamentoMarkPaidIn,
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    ym = _normalize_competencia(body.competencia)
+
+    r = await db.execute(
+        select(Student).where(and_(Student.id == body.aluno_id, Student.mentor_id == me.id))
+    )
+    st = r.scalar_one_or_none()
+    if not st:
+        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+
+    existing_q = select(Pagamento).where(
+        and_(
+            Pagamento.mentor_id == me.id,
+            Pagamento.student_id == body.aluno_id,
+            Pagamento.competencia == ym,
+        )
+    )
+    res = await db.execute(existing_q)
+    existing = res.scalar_one_or_none()
+
+    if existing:
+        existing.valor = body.valor
+        existing.status_pagamento = "pago"
+        existing.paid_at = body.data_pagamento
+        existing.method = body.meio
+        if body.referencia:
+            existing.external_reference = body.referencia
+        existing.source = existing.source or "manual"
+        db.add(existing)
+        await db.commit()
+        await db.refresh(existing)
+        return PagamentoOut.model_validate(existing)
+
+    due = _due_for(ym, st)
+    novo = Pagamento(
+        mentor_id=me.id,
+        student_id=body.aluno_id,
+        competencia=ym,
+        due_date=due,
+        valor=body.valor,
+        status_pagamento="pago",
+        source="manual",
+        external_reference=body.referencia,
+        paid_at=body.data_pagamento,
+        method=body.meio,
+    )
+    db.add(novo)
+    await db.commit()
+    await db.refresh(novo)
+    return PagamentoOut.model_validate(novo)
+
+# ---------- desfazer (DELETE by aluno/competencia) ----------
+@router.delete("/by-aluno/{aluno_id}/{competencia}")
+@router.delete("/pagamentos/by-aluno/{aluno_id}/{competencia}")  # alias caso o prefixo seja apenas "/financeiro"
+async def delete_pagamento_by_aluno_competencia(
+    aluno_id: int = Path(..., gt=0),
+    competencia: str = Path(..., description="YYYY-MM ou YYYY-MM-01"),
+    db: AsyncSession = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    ym = _normalize_competencia(competencia)
+    q = select(Pagamento).where(
+        and_(
+            Pagamento.mentor_id == me.id,
+            Pagamento.student_id == aluno_id,
+            Pagamento.competencia == ym,
+        )
+    )
+    res = await db.execute(q)
+    row = res.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Pagamento não encontrado")
+
+    await db.delete(row)
+    await db.commit()
+    return {"ok": True}
